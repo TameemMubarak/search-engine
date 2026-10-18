@@ -1,0 +1,474 @@
+import os
+import time
+
+# import hashlib
+import django
+import requests
+
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+os.environ.setdefault(
+    "DJANGO_SETTINGS_MODULE",
+    "config.settings"
+)
+
+django.setup()
+
+from documents.models import Document
+from search_core.database_frontier import DatabaseFrontier
+from search_core.index_manager import IndexManager
+
+from search_core.incremental_indexer import IncrementalIndexer
+from search_core.content_hash import calculate_content_hash
+
+
+
+
+from search_core.url_utils import (
+    normalize_url,
+    get_domain,
+    is_same_domain
+)
+from search_core.robots import RobotsChecker
+
+
+class DatabaseCrawler:
+
+    USER_AGENT = "MySearchEngineBot/0.1"
+
+    def __init__(
+        self,
+        seed_url,
+        max_pages=10,
+        delay=1.0,
+        max_depth=3
+    ):
+
+        normalized_seed = normalize_url(
+            seed_url
+        )
+
+        if not normalized_seed:
+            raise ValueError(
+                "Invalid seed URL"
+            )
+
+        self.seed_url = normalized_seed
+
+        self.allowed_domain = get_domain(
+            normalized_seed
+        )
+
+        self.max_pages = max_pages
+
+        self.max_depth = max_depth
+        
+        self.delay = delay
+
+        self.frontier = DatabaseFrontier()
+
+        self.robots = RobotsChecker(
+            normalized_seed,
+            self.USER_AGENT
+        )
+
+        self.robots.load()
+
+        self.frontier.add(
+            normalized_seed,
+            depth=0
+        )
+
+        self.index_manager = IndexManager()
+        self.incremental_indexer = IncrementalIndexer(
+            self.index_manager.index
+        )
+
+
+# hashing databse docs  -- not needed further
+    # def calculate_content_hash(self, title, content):
+
+    #     text = f"{title}\n{content}"
+
+    #     return hashlib.sha256(
+    #         text.encode("utf-8")
+    #         ).hexdigest()
+
+
+    def fetch(self, url):
+
+        try:
+
+            response = requests.get(
+                url,
+                timeout=10,
+                headers={
+                    "User-Agent": self.USER_AGENT
+                }
+            )
+
+            return response
+
+        except requests.RequestException as error:
+
+            print(
+                f"Request failed: {error}"
+            )
+
+            return None
+
+    def parse(self, url, html):
+
+        soup = BeautifulSoup(
+            html,
+            "html.parser"
+        )
+
+        # Remove elements that don't
+        # represent useful page content.
+
+        # older formating of document
+        # for element in soup(
+        #     ["script", "style", "noscript"]
+        # ):
+        #     element.decompose()
+        for element in soup(
+            [
+                "script",
+                "style",
+                "noscript",
+                "nav",
+                "header",
+                "footer",
+                "aside"
+            ]
+        ):
+            element.decompose()
+
+        title = ""
+
+        if soup.title:
+
+            title = soup.title.get_text(
+                strip=True
+            )
+
+        content = soup.get_text(
+            separator=" ",
+            strip=True
+        )
+
+        links = []
+
+        for anchor in soup.find_all(
+            "a",
+            href=True
+        ):
+
+            absolute_url = urljoin(
+                url,
+                anchor["href"]
+            )
+
+            normalized_url = normalize_url(
+                absolute_url
+            )
+
+            if not normalized_url:
+                continue
+
+            if not is_same_domain(
+                normalized_url,
+                self.allowed_domain
+            ):
+                continue
+
+            links.append(
+                normalized_url
+            )
+
+        return {
+            "url": url,
+            "title": title,
+            "content": content,
+            "links": links
+        }
+# this is old way to save document..
+    # def save_document(self, page):
+
+    #     document, created = (
+    #         Document.objects.update_or_create(
+    #             url=page["url"],
+    #             defaults={
+    #                 "title": page["title"],
+    #                 "content": page["content"]
+    #             }
+    #         )
+    #     )
+
+    #     if created:
+
+    #         print(
+    #             "Document created."
+    #         )
+
+    #     else:
+
+    #         print(
+    #             "Document updated."
+    #         )
+
+    #     return document
+
+    def save_document(self, page):
+
+        new_hash = calculate_content_hash(
+            page["title"],
+            page["content"]
+        )
+
+        try:
+            document = Document.objects.get(
+                url=page["url"]
+            )
+
+            if document.content_hash == new_hash:
+
+                print("Document unchanged.")
+
+                return document, False
+
+            document.title = page["title"]
+            document.content = page["content"]
+            document.content_hash = new_hash
+
+            document.save()
+
+            print("Document changed.")
+            print("Updating search index.")
+
+            self.index_manager.update_document(
+                document
+            )
+
+            return document, True
+
+        except Document.DoesNotExist:
+
+            document = Document.objects.create(
+                url=page["url"],
+                title=page["title"],
+                content=page["content"],
+                content_hash=new_hash
+            )
+
+            print("Document created.")
+            print("Adding to search index.")
+
+            self.index_manager.add_document(
+                document
+            )
+
+            return document, True
+    def continuous_crawl(self, idle_seconds=60):
+        print("\\n==============================")
+        print("CONTINUOUS CRAWLER STARTED")
+        print("==============================")
+
+        while True:
+            retried = self.frontier.retry_failed()
+            self.frontier.recover_stuck()
+            if retried:
+                print(f"Retried failed URLs: {retried}")
+
+            self.max_pages = 1
+            before = self.frontier.pending_count()
+            self.crawl()
+
+            if before == 0 and self.frontier.pending_count() == 0:
+                print(f"No pending URLs. Sleeping {idle_seconds} seconds...")
+                time.sleep(idle_seconds)
+
+    def crawl(self):
+
+        pages_crawled = 0
+
+        while (
+            pages_crawled < self.max_pages
+        ):
+# old way 
+            # crawl_url = (
+            #     self.frontier.get_next()
+            # )
+
+            crawl_url = self.frontier.get_next()
+
+            if crawl_url is None:
+
+                print(
+                    "\nNo pending URLs."
+                )
+
+                break
+
+            url = crawl_url.url
+
+            print(
+                f"\nCrawling: {url}"
+            )
+
+            if not self.robots.allowed(url):
+
+                print(
+                    "Blocked by robots.txt"
+                )
+
+                self.frontier.mark_failed(
+                    crawl_url,
+                    "Blocked by robots.txt"
+                )
+
+                continue
+
+            response = self.fetch(url)
+
+            if response is None:
+
+                self.frontier.mark_failed(
+                    crawl_url,
+                    "Request failed"
+                )
+
+                continue
+
+            print(
+                f"Status: "
+                f"{response.status_code}"
+            )
+
+            if response.status_code != 200:
+
+                self.frontier.mark_failed(
+                    crawl_url,
+                    f"HTTP {response.status_code}"
+                )
+
+                continue
+
+            content_type = response.headers.get(
+                "Content-Type",
+                ""
+            ).lower()
+
+            if "text/html" not in content_type:
+
+                self.frontier.mark_failed(
+                    crawl_url,
+                    f"Non-HTML content: {content_type}"
+                )
+
+                continue
+
+            page = self.parse(
+                url,
+                response.text
+            )
+
+            print(
+                f"Title: {page['title']}"
+            )
+
+            print(
+                f"Characters: "
+                f"{len(page['content'])}"
+            )
+
+            print(
+                f"Links: "
+                f"{len(page['links'])}"
+            )
+
+            #self.save_document(page)
+
+            document, changed = self.save_document(page)
+
+            if changed:
+                print("Index updated.")
+
+            else:
+                print(
+                    "Document unchanged. "
+                    "Index update not required."
+                )
+
+# old way of drilling logic        
+            # for link in page["links"]:
+
+            #     self.frontier.add(
+            #         link,
+            #         depth=crawl_url.depth + 1
+            #     )
+
+            # new depth drilling logic
+            if crawl_url.depth < self.max_depth:
+
+                for link in page["links"]:
+
+                    self.frontier.add(
+                        link,
+                        depth=crawl_url.depth + 1
+                    )
+
+            self.frontier.mark_completed(
+                crawl_url
+            )
+
+            pages_crawled += 1
+
+            print(
+                f"Pages crawled: "
+                f"{pages_crawled}"
+            )
+
+            time.sleep(
+                self.delay
+            )
+
+        print(
+            "\n=============================="
+        )
+
+        print(
+            "DATABASE CRAWL COMPLETED"
+        )
+
+        print(
+            "=============================="
+        )
+
+        print(
+            f"Pages crawled: "
+            f"{pages_crawled}"
+        )
+
+        print(
+            f"Pending URLs: "
+            f"{self.frontier.pending_count()}"
+        )
+
+        print(
+            f"Completed URLs: "
+            f"{self.frontier.completed_count()}"
+        )
+        print(self.max_pages)
+
+if __name__ == "__main__":
+
+    crawler = DatabaseCrawler(
+        "https://www.tutorialspoint.com/",
+        max_pages=5,
+        delay=1.0
+    )
+
+    crawler.crawl()
